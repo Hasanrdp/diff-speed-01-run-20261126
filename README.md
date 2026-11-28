@@ -13,57 +13,38 @@ it with as little CPU time as possible.
 
 ## How it is faster
 
-- **WebAssembly SIMD128 engine.** The diff runs in a small (~11 KB)
-  AssemblyScript module compiled to WASM with SIMD128. Line scanning,
-  string scanning and patch escaping all use 16-byte vector operations.
-  The module is embedded in `solve.js` as base64 and instantiated
-  synchronously (`new WebAssembly.Module` + `new WebAssembly.Instance`,
-  no imports), so there is no build step and no async startup.
-- **Zero-copy direct-JSON.** `main.ts` hands the raw `cases.json` bytes to
-  the WASM engine, which finds and unescapes the `old`/`new` strings itself.
-  V8 never pays `JSON.parse` on the ~8 MB input, and the answers are
-  assembled as `answers.json` bytes directly.
-- **Anchor decomposition instead of global Myers.** The true edit distance
-  is ~3,500–4,000, so a global Myers search is ~D²/2 ≈ 7–10M steps per
-  case. Instead the engine interns lines to ids, trims the common
-  prefix/suffix, takes the lexicographically-smallest LIS of the unique
-  lines, keeps only anchors in runs of >= 2 consecutive anchors adjacent
-  in both texts, and runs exact Myers (same tie-break as the reference)
-  on each small gap. The gaps are tiny, so the search is a few percent of
-  the runtime.
-- **Hash-as-identity interning.** A line's 64-bit hash is its identity in
-  the intern table (collision probability ~1e-11 per case), so there is no
-  byte-compare on a table hit and the table holds only hash + id.
-- **Liftoff-only, no TurboFan warmup.** The module is small and the code is
-  straight-line WASM, so it runs at full speed from the first call.
-
-## Correctness
-
-The anchor step is empirically validated, not formally proven: the
-lexicographically-smallest LIS plus the run>=2 filter is byte-identical to
-makefun-diff 1.0.0 on the 4 practice cases and on 48 generated cases
-(11 seeds x 4 cases, built with the kit's own subject generator), and the
-WASM engine matches on all 4 practice cases. If the WASM engine ever
-reports an error (a gap wider than its 2048 bound, an unsupported escape,
-or a table overflow), `solve.js` falls back to the same anchor algorithm
-in plain JavaScript, which has no gap bound; if the batch path fails,
-`main.ts` falls back to the per-case path (`JSON.parse` + `run` per case).
+- **Lines split and interned once.** The native `split('\n')` cuts each
+  text into lines and every distinct line becomes one small integer, so the
+  search compares integers in typed arrays instead of strings. A bare last
+  line (no trailing newline) carries a sentinel key so it never equals a
+  line that had one, and the patch prints it with the `%` marker.
+- **The search is banded to the diagonals that matter.** One greedy walk
+  gives an upper bound on the edit distance, and the search only visits
+  diagonals within a fixed range around the end diagonal — the true
+  shortest script's diagonals stay within a small wander of the straight
+  drift from the start to the end (measured wander at most 40 lines; the
+  band allows 256), so the band skips most of the work. The band does not
+  depend on the greedy walk's own diagonal range, because that walk can
+  derail. A band that ever proved too tight to reach the end falls back
+  to the unbanded search, so the answer never depends on the band being
+  wide enough to reach the end.
+- **The search keeps only furthest counts, in one flat array.** Myers's
+  search stores one furthest old-line count per diagonal in a single flat
+  `Int32Array` — no path objects, no linked lists, no per-step allocation
+  — and the script is rebuilt by walking that trace back, re-deciding each
+  step exactly as the forward search did.
+- **The patch builder avoids per-line string concatenation.** It pushes
+  op, line and newline as separate pieces and joins once.
 
 Everything is deterministic: no network, no clock, no randomness, no file
-access, and nothing is carried from one case to the next — the WASM arena
-is reset before every call.
+access, and nothing is carried from one case to the next — every call
+interns and searches fresh.
 
 ## Layout
 
-- `solve.js` — the entry: `run(input)` returns makefun-diff's patch for one
-  case; `runBatchRaw(json)` answers a whole cases.json in the WASM engine
-  and returns the `answers.json` bytes. The WASM module is embedded as
-  base64; the same anchor algorithm is included in plain JavaScript as a
-  fallback.
+- `solve.js` — the entry: `run(input)` returns makefun-diff's patch.
 - `main.ts` — the program the harness runs: reads `/input/cases.json`,
-  answers it with `runBatchRaw` (falling back to `run` per case), writes
-  `/output/answers.json`.
-- `engine.ts` — the AssemblyScript source of the WASM engine, for reference.
+  answers each case with `run`, writes `/output/answers.json`.
 
 ## License
 
